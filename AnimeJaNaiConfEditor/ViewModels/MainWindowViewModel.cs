@@ -8,6 +8,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
+using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -20,6 +21,15 @@ namespace AnimeJaNaiConfEditor.ViewModels
         private static readonly CultureInfo ENGLISH_CULTURE = CultureInfo.GetCultureInfo("en-US");
 
         public static MainWindowViewModel? Instance { get; private set; }
+
+        // Platform gate: Windows-only paths (TensorRT/DirectML auto-flip, nvinfer probing,
+        // benchmark .bat, explorer.exe, the Components tab) are guarded behind this so the
+        // Vulkan/Linux build never trips over them. Bound from XAML too.
+        public static bool IsWindows { get; } = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        // Convenience inverse for XAML visibility (Vulkan toggle, Linux-only panels) — Avalonia
+        // x:Static can't negate, so expose the complement directly.
+        public static bool IsNotWindows { get; } = !IsWindows;
 
         public MainWindowViewModel()
         {
@@ -86,6 +96,24 @@ namespace AnimeJaNaiConfEditor.ViewModels
 
         public void RefreshComponentAwareness()
         {
+            // On Linux the Vulkan backend is the only path; TensorRT/DirectML and their
+            // disk/GPU probing don't apply, so leave the (Vulkan) selection alone and
+            // clear any leftover TensorRT notice.
+            if (!IsWindows)
+            {
+                TrtSelectable = false;
+                BackendNotice = "";
+                RifeMissing = !RifeOnDisk();
+                foreach (var slot in AnimeJaNaiConf?.UpscaleSlots ?? [])
+                {
+                    foreach (var chain in slot.Chains)
+                    {
+                        chain.RaisePropertyChanged(nameof(UpscaleChain.RifeToggleEnabled));
+                    }
+                }
+                return;
+            }
+
             bool trtInstalled = TrtOnDisk();
             bool? nvidia = ComponentManager.GpuNvidia;
             bool trtUsable = trtInstalled && nvidia != false;
@@ -565,8 +593,15 @@ chain_2_rife=no";
 
         public AvaloniaList<string> GetAllModels()
         {
-            return new AvaloniaList<string>(Directory.GetFiles(OnnxPath).Where(filename => Path.GetExtension(filename).Equals(".onnx", StringComparison.CurrentCultureIgnoreCase))
+            // ONNX (TensorRT/DirectML) and ncnn .param (Vulkan) models live side by side and are
+            // referenced in the conf by their extensionless name, so a single deduped list of names
+            // covers every backend — and on Linux only .param/.bin exist.
+            return new AvaloniaList<string>(Directory.GetFiles(OnnxPath)
+                .Where(filename =>
+                    Path.GetExtension(filename).Equals(".onnx", StringComparison.CurrentCultureIgnoreCase) ||
+                    Path.GetExtension(filename).Equals(".param", StringComparison.CurrentCultureIgnoreCase))
                 .Select(filename => Path.GetFileNameWithoutExtension(filename))
+                .Distinct()
                 .Order().ToList());
         }
 
@@ -726,13 +761,19 @@ chain_2_rife=no";
 
             animeJaNaiConf.EnableLogging = ParseBool(parser.GetValue("global", "logging", "no"));
             animeJaNaiConf.BackendAutoFallback = ParseBool(parser.GetValue("global", "backend_auto_fallback", "no"));
-            if (Enum.TryParse(parser.GetValue("global", "backend", "TensorRT"), out Backend backend))
+            // When [global] backend is absent, Linux defaults to the only backend it ships
+            // (Vulkan / aji_vk); Windows keeps its TensorRT default unchanged.
+            var defaultBackend = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "Vulkan" : "TensorRT";
+            if (Enum.TryParse(parser.GetValue("global", "backend", defaultBackend), ignoreCase: true, out Backend backend))
             {
                 switch (backend)
                 {
                     case Backend.DirectML:
                     case Backend.NCNN: // retired; the inference shim treats NCNN as DirectML
                         animeJaNaiConf.SetDirectMlSelected();
+                        break;
+                    case Backend.Vulkan:
+                        animeJaNaiConf.SetVulkanSelected();
                         break;
                     case Backend.TensorRT:
                     default:
@@ -1153,6 +1194,13 @@ chain_2_rife=no";
         public async void LaunchBenchmark()
 #pragma warning restore CA1822 // Mark members as static
         {
+            // The benchmark harness is a Windows .bat; there is no Linux equivalent yet,
+            // so on non-Windows this is a no-op (the button is hidden in the UI anyway).
+            if (!IsWindows)
+            {
+                return;
+            }
+
             await Task.Run(async () =>
             {
                 using var process = new Process();
@@ -1177,7 +1225,15 @@ chain_2_rife=no";
         {
             await Task.Run(() =>
             {
-                Process.Start("explorer.exe", OnnxPath);
+                if (IsWindows)
+                {
+                    Process.Start("explorer.exe", OnnxPath);
+                }
+                else
+                {
+                    // xdg-open is the freedesktop default file-manager launcher on Linux.
+                    Process.Start(new ProcessStartInfo("xdg-open", OnnxPath) { UseShellExecute = false });
+                }
             });
         }
 
@@ -1275,6 +1331,7 @@ chain_2_rife=no";
                     x => x.EnableLogging,
                     x => x.TensorRtSelected,
                     x => x.DirectMlSelected,
+                    x => x.VulkanSelected,
                     x => x.BackendAutoFallback,
                     x => x.TrtEngineSettings).Subscribe(x =>
                     {
@@ -1340,6 +1397,18 @@ chain_2_rife=no";
             set
             {
                 this.RaiseAndSetIfChanged(ref _directMlSelected, value);
+            }
+        }
+
+        // Vulkan / aji_vk (ncnn) backend — the cross-platform path used on Linux/AMD.
+        private bool _vulkanSelected = false;
+        [DataMember]
+        public bool VulkanSelected
+        {
+            get => _vulkanSelected;
+            set
+            {
+                this.RaiseAndSetIfChanged(ref _vulkanSelected, value);
             }
         }
 
@@ -1523,12 +1592,21 @@ chain_2_rife=no";
         {
             TensorRtSelected = true;
             DirectMlSelected = false;
+            VulkanSelected = false;
         }
 
         public void SetDirectMlSelected()
         {
             DirectMlSelected = true;
             TensorRtSelected = false;
+            VulkanSelected = false;
+        }
+
+        public void SetVulkanSelected()
+        {
+            VulkanSelected = true;
+            TensorRtSelected = false;
+            DirectMlSelected = false;
         }
 
         public void UserSelectTensorRt()
@@ -1543,6 +1621,12 @@ chain_2_rife=no";
             SetDirectMlSelected();
         }
 
+        public void UserSelectVulkan()
+        {
+            BackendAutoFallback = false;
+            SetVulkanSelected();
+        }
+
         private bool _backendAutoFallback;
         [DataMember]
         public bool BackendAutoFallback
@@ -1551,7 +1635,10 @@ chain_2_rife=no";
             set => this.RaiseAndSetIfChanged(ref _backendAutoFallback, value);
         }
 
-        public Backend SelectedBackend => DirectMlSelected ? Backend.DirectML : Backend.TensorRT;
+        public Backend SelectedBackend =>
+            VulkanSelected ? Backend.Vulkan :
+            DirectMlSelected ? Backend.DirectML :
+            Backend.TensorRT;
     }
 
     [DataContract]
@@ -1922,6 +2009,7 @@ chain_2_rife=no";
     {
         TensorRT,
         DirectML,
-        NCNN
+        NCNN,
+        Vulkan
     }
 }
