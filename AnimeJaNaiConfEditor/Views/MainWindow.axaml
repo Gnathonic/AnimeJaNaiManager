@@ -186,6 +186,19 @@
           <TextBlock Width="280" TextWrapping="WrapWithOverflow" Margin="0,5,10,0" FontSize="10" Opacity=".5">Measure your real playback fps (the speed you will actually get) at several resolutions. mpv windows will open and close on their own during the test; leave them alone or the results will be invalid. Can take 10+ minutes depending on your hardware.</TextBlock>
         </StackPanel>
       </Button>
+      <!-- Linux equivalent: the Vulkan backend has no TensorRT engine-build step, so the
+           benchmark runs the bundled mpv offscreen (no windows, no engine build, ~1 min). -->
+      <Button HorizontalAlignment="Stretch" FontSize="13" Padding="10" Click="RunBenchmarkButtonClick" HorizontalContentAlignment="Left" IsVisible="{x:Static vm:MainWindowViewModel.IsNotWindows}">
+        <StackPanel>
+          <StackPanel Orientation="Horizontal">
+            <materialIcons:MaterialIcon Kind="Finance" VerticalAlignment="Center" />
+            <TextBlock Margin="10,0,10,0" VerticalAlignment="Center" Width="190">
+              Run Benchmarks
+            </TextBlock>
+          </StackPanel>
+          <TextBlock Width="280" TextWrapping="WrapWithOverflow" Margin="0,5,10,0" FontSize="10" Opacity=".5">Measure your real playback fps (the speed you will actually get) at several source resolutions on the Vulkan backend. Runs the bundled mpv offscreen with no windows to click; usually takes about a minute.</TextBlock>
+        </StackPanel>
+      </Button>
       <Button HorizontalAlignment="Stretch" FontSize="13" Padding="10" Click="SubmitBenchmarkButtonClick" HorizontalContentAlignment="Left">
         <StackPanel>
           <StackPanel Orientation="Horizontal">

@@ -1,4 +1,5 @@
-﻿using Avalonia.Collections;
+﻿using AnimeJaNaiConfEditor.Services;
+using Avalonia.Collections;
 using ReactiveUI;
 using Salaros.Configuration;
 using System;
@@ -1194,8 +1195,9 @@ chain_2_rife=no";
         public async void LaunchBenchmark()
 #pragma warning restore CA1822 // Mark members as static
         {
-            // The benchmark harness is a Windows .bat; there is no Linux equivalent yet,
-            // so on non-Windows this is a no-op (the button is hidden in the UI anyway).
+            // Linux has its own benchmark path, driven from the View so it can show
+            // progress and surface results in a dialog (see RunLinuxBenchmark*). It is
+            // never launched through here, so on non-Windows this stays a no-op.
             if (!IsWindows)
             {
                 return;
@@ -1218,6 +1220,32 @@ chain_2_rife=no";
                 await process.WaitForExitAsync();
             });
         }
+
+        // ---- Linux / Vulkan playback benchmark ------------------------------------
+        // The Windows benchmark is a TensorRT-building PowerShell harness; the Vulkan
+        // backend has no engine-build step, so Linux runs the bundled mpv directly
+        // (LinuxBenchmark service). These helpers keep the View thin: it owns the
+        // progress dialog, the ViewModel owns the package paths and backend label.
+
+        // The package root (install root): mpv + portable_config + animejanai/ live
+        // here. RootDir already resolves both install layouts.
+        private static LinuxBenchmark.Paths LinuxBenchmarkPaths() =>
+            LinuxBenchmark.ResolvePaths(RootDir, DataDir);
+
+        // null = ready to run; otherwise a user-facing reason it cannot.
+        public string? LinuxBenchmarkPrerequisiteError() =>
+            LinuxBenchmark.CheckPrerequisites(LinuxBenchmarkPaths());
+
+        // The current backend label, used in the results banner / benchmark.txt.
+        // On Linux this is always Vulkan, but read it from the conf so a future
+        // backend is reflected automatically.
+        public string LinuxBenchmarkBackendLabel =>
+            AnimeJaNaiConf?.SelectedBackend.ToString() ?? "Vulkan";
+
+        public Task<System.Collections.Generic.List<LinuxBenchmark.Result>> RunLinuxBenchmarkAsync(
+            Action<string>? progress = null,
+            System.Threading.CancellationToken ct = default) =>
+            LinuxBenchmark.RunAsync(LinuxBenchmarkPaths(), LinuxBenchmarkBackendLabel, progress, ct);
 
 #pragma warning disable CA1822 // Mark members as static
         public async void OpenModelsDirectory()

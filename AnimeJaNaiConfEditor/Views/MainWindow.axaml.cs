@@ -11,6 +11,7 @@ using Avalonia.Layout;
 using Avalonia.Markup.Xaml;
 using Avalonia.Media;
 using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using ReactiveUI.Avalonia;
 using FluentAvalonia.UI.Controls;
 using FluentAvalonia.UI.Windowing;
@@ -325,6 +326,14 @@ namespace AnimeJaNaiConfEditor.Views
         {
             if (DataContext is not MainWindowViewModel vm) return;
 
+            // The Vulkan backend (Linux) has no TensorRT engine-build step, so the
+            // benchmark runs the bundled mpv directly and the wording / flow differ.
+            if (MainWindowViewModel.IsNotWindows)
+            {
+                await RunLinuxBenchmarkAsync(vm);
+                return;
+            }
+
             const string runResult = "run";
             var td = new FATaskDialog
             {
@@ -350,6 +359,165 @@ namespace AnimeJaNaiConfEditor.Views
             td.XamlRoot = this;
             if (Equals(await td.ShowAsync(), runResult))
                 vm.LaunchBenchmark();
+        }
+
+        // Linux/Vulkan benchmark: confirm (no TensorRT wording), run offscreen mpv
+        // across resolutions with a progress dialog, then show the fps results. The
+        // run writes benchmark.txt so "Submit to Catalog" works exactly as on Windows.
+        private async Task RunLinuxBenchmarkAsync(MainWindowViewModel vm)
+        {
+            if (vm.LinuxBenchmarkPrerequisiteError() is { } missing)
+            {
+                await ShowInfoDialog("Can't run the benchmark", missing);
+                return;
+            }
+
+            const string runResult = "run";
+            var confirm = new FATaskDialog
+            {
+                Title = "Run playback benchmark",
+                Content = new TextBlock
+                {
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 460,
+                    Text =
+                        "This measures your real playback fps across several source resolutions " +
+                        "using the Vulkan backend and your current profile.\n\n" +
+                        "It runs the bundled mpv offscreen (no windows open), generating short " +
+                        "synthetic test clips with ffmpeg, so there is nothing to click. It " +
+                        "usually takes about a minute.",
+                },
+                Buttons =
+                {
+                    new FATaskDialogButton("Start benchmark", runResult),
+                    FATaskDialogButton.CancelButton,
+                },
+            };
+            confirm.XamlRoot = this;
+            if (!Equals(await confirm.ShowAsync(), runResult))
+                return;
+
+            var statusText = new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 460,
+                Text = "Starting benchmark...",
+            };
+            var progressDialog = new FATaskDialog
+            {
+                Title = "Running playback benchmark",
+                Content = statusText,
+                ShowProgressBar = true,
+                Buttons = { FATaskDialogButton.CancelButton },
+            };
+            progressDialog.SetProgressBarState(0, FATaskDialogProgressState.Indeterminate);
+            progressDialog.XamlRoot = this;
+
+            using var cts = new System.Threading.CancellationTokenSource();
+            progressDialog.Closing += (s, ev) =>
+            {
+                // Any close that isn't us completing the run is a cancel request.
+                if (!_benchmarkDone) cts.Cancel();
+            };
+
+            _benchmarkDone = false;
+            System.Collections.Generic.List<AnimeJaNaiConfEditor.Services.LinuxBenchmark.Result>? results = null;
+            Exception? failure = null;
+
+            var runTask = Task.Run(async () =>
+            {
+                try
+                {
+                    void Report(string s) => Dispatcher.UIThread.Post(() => statusText.Text = s);
+                    results = await vm.RunLinuxBenchmarkAsync(Report, cts.Token);
+                }
+                catch (OperationCanceledException) { /* user cancelled */ }
+                catch (Exception ex) { failure = ex; }
+                finally
+                {
+                    _benchmarkDone = true;
+                    Dispatcher.UIThread.Post(() => progressDialog.Hide());
+                }
+            });
+
+            await progressDialog.ShowAsync();
+            await runTask;
+
+            if (cts.IsCancellationRequested && results == null)
+                return;   // cancelled before completing
+            if (failure != null)
+            {
+                await ShowInfoDialog("Benchmark failed", failure.Message);
+                return;
+            }
+            if (results == null)
+                return;
+
+            await ShowLinuxBenchmarkResults(vm, results);
+        }
+
+        // Guards the progress dialog's Closing handler: true once the run finished
+        // (so Hide() isn't misread as a cancel).
+        private bool _benchmarkDone;
+
+        private async Task ShowLinuxBenchmarkResults(
+            MainWindowViewModel vm,
+            System.Collections.Generic.List<AnimeJaNaiConfEditor.Services.LinuxBenchmark.Result> results)
+        {
+            var panel = new StackPanel { Width = 460 };
+            panel.Children.Add(new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                Text = $"Playback fps on the {vm.LinuxBenchmarkBackendLabel} backend (2x upscale). " +
+                       "Higher is better; 24+ fps generally means smooth real-time playback for that source.",
+            });
+
+            var grid = new Grid { Margin = new Thickness(0, 10, 0, 0) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+            grid.ColumnDefinitions.Add(new ColumnDefinition(new GridLength(1, GridUnitType.Star)));
+            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+
+            TextBlock Cell(string text, int row, int col, bool header = false) => new()
+            {
+                Text = text,
+                FontWeight = header ? FontWeight.Bold : FontWeight.Normal,
+                Margin = new Thickness(0, 2, 16, 2),
+                FontFamily = new FontFamily("Consolas, Cascadia Mono, monospace"),
+                [Grid.RowProperty] = row,
+                [Grid.ColumnProperty] = col,
+            };
+            grid.Children.Add(Cell("Source -> 2x", 0, 0, header: true));
+            grid.Children.Add(Cell("fps", 0, 1, header: true));
+
+            for (var i = 0; i < results.Count; i++)
+            {
+                var r = results[i];
+                grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                grid.Children.Add(Cell($"{r.Label} -> {r.DstLabel}", i + 1, 0));
+                var fpsText = r.Fps.HasValue
+                    ? r.Fps.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)
+                    : (r.Error is { Length: > 0 } ? "error" : "-");
+                grid.Children.Add(Cell(fpsText, i + 1, 1));
+            }
+            panel.Children.Add(grid);
+
+            panel.Children.Add(new TextBlock
+            {
+                Margin = new Thickness(0, 12, 0, 0),
+                Opacity = .6,
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Text = "Saved to benchmark.txt. Use \"Submit to Catalog\" to share these results.",
+            });
+
+            var td = new FATaskDialog
+            {
+                Title = "Benchmark results",
+                Content = panel,
+                Buttons = { FATaskDialogButton.OKButton },
+            };
+            td.XamlRoot = this;
+            await td.ShowAsync();
         }
 
         private async void SubmitBenchmarkButtonClick(object? sender, RoutedEventArgs e)
