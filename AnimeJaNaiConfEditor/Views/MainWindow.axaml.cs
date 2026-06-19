@@ -486,14 +486,14 @@ namespace AnimeJaNaiConfEditor.Views
                 [Grid.RowProperty] = row,
                 [Grid.ColumnProperty] = col,
             };
-            grid.Children.Add(Cell("Source -> 2x", 0, 0, header: true));
+            grid.Children.Add(Cell("Profile / Source -> 2x", 0, 0, header: true));
             grid.Children.Add(Cell("fps", 0, 1, header: true));
 
             for (var i = 0; i < results.Count; i++)
             {
                 var r = results[i];
                 grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-                grid.Children.Add(Cell($"{r.Label} -> {r.DstLabel}", i + 1, 0));
+                grid.Children.Add(Cell($"{r.Profile}  {r.Label} -> {r.DstLabel}", i + 1, 0));
                 var fpsText = r.Fps.HasValue
                     ? r.Fps.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)
                     : (r.Error is { Length: > 0 } ? "error" : "-");

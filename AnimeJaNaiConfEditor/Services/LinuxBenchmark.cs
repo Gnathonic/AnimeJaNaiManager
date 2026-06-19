@@ -13,48 +13,62 @@ namespace AnimeJaNaiConfEditor.Services
 {
     // Linux/Vulkan playback benchmark.
     //
-    // The Windows benchmark is a PowerShell harness that builds a TensorRT engine
-    // per resolution before timing; none of that applies to the Vulkan (ncnn)
-    // backend, which has no engine-build step. This is a self-contained,
-    // dependency-light equivalent: it generates short synthetic clips with the
-    // system ffmpeg, then plays each one through the bundled mpv with the aji
-    // upscale filter active (--vo=null, offscreen) and measures throughput as
-    // frames / wall-clock seconds.
+    // Aligned with the Windows PowerShell harness (animejanai/benchmarks/
+    // benchmark.ps1) so the numbers are directly comparable:
+    //   - Uses the built-in BENCHMARK slots 1010 (Balanced) and 1011
+    //     (Performance), which run the HD model UNCONDITIONALLY at every
+    //     resolution. (The regular slots 1001-1003 are resolution-conditional and
+    //     fall to the SD model below 720p, which is NOT what the catalog measures.)
+    //   - Same source resolutions as the Windows clip set.
+    //   - Excludes warm-up: ncnn has no TensorRT-style engine build, but the first
+    //     frames still pay pipeline creation + GPU clock ramp. A short probe run and
+    //     a longer sample run are timed; the steady-state fps is the extra sample
+    //     frames divided by the extra wall-clock (the shared init/warm-up cancels).
     //
-    // It writes benchmark.txt in the same markdown-table shape the
-    // Submit-to-Catalog parser (BenchmarkSubmission.FromBenchmarkFile) expects,
-    // so the existing submit flow keeps working unchanged.
+    // Writes benchmark.txt in the markdown-table shape the Submit-to-Catalog parser
+    // (BenchmarkSubmission.FromBenchmarkFile) expects: resolution columns, one row
+    // per profile.
     //
-    // Linux-only: every caller is already gated behind
-    // RuntimeInformation.IsOSPlatform(OSPlatform.Linux); the Windows path is
-    // untouched.
+    // Linux-only: every caller is gated behind RuntimeInformation.IsOSPlatform(
+    // OSPlatform.Linux); the Windows path is untouched.
     public static class LinuxBenchmark
     {
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
-        // Source resolutions to benchmark, with the human label used as the
-        // table column. Low source resolutions are the value case for AnimeJaNai
-        // (the upscale benefit is greatest there), so the set stays in that range.
+        // Source resolutions, matching the Windows benchmark clip set (ascending by
+        // pixel count). 2x upscale, so 480x360 -> 960x720, 1920x1080 -> 3840x2160.
         public static readonly (int W, int H)[] Resolutions =
         {
             (480, 360),
             (640, 480),
-            (720, 540),
-            (960, 720),
+            (768, 576),
             (1280, 720),
+            (1920, 1080),
         };
 
-        // Clip framerate and length. ~6 s at 24 fps = 144 frames: long enough
-        // that the one-time model load / warm-up is amortised into a steady-state
-        // figure, short enough to keep the whole run quick.
+        // The benchmark profiles = the built-in benchmark slots (HD model at every
+        // resolution), so a 360p cell measures the HD model, not the SD fallback.
+        public static readonly (string Name, int Slot)[] Profiles =
+        {
+            ("Balanced", 1010),
+            ("Performance", 1011),
+        };
+
         private const int ClipFps = 24;
-        private const int ClipSeconds = 6;
-        private const int ClipFrames = ClipFps * ClipSeconds;
+        // Long enough to supply probe + the largest sample (48 + 600) without
+        // looping (looping interacts badly with --frames under --untimed).
+        private const int ClipSeconds = 30;          // 720 frames @ 24 fps
+        private const int ProbeFrames = 48;          // warm-up probe (subtracted out)
+        private const int SampleSeconds = 5;         // target steady-state sample length
+        private const int SampleFramesMin = 120;
+        private const int SampleFramesMax = 600;
 
         public sealed class Result
         {
             public int SrcW { get; init; }
             public int SrcH { get; init; }
+            public required string Profile { get; init; }
+            public int Slot { get; init; }
             // fps measured, or null if the cell couldn't be measured.
             public double? Fps { get; init; }
             public string? Error { get; init; }
@@ -71,9 +85,9 @@ namespace AnimeJaNaiConfEditor.Services
             public required string DataDir { get; init; }
         }
 
-        // Resolve the package layout from the editor's own location. rootDir is
-        // the install root (mpv + portable_config + animejanai/ live here);
-        // dataDir is animejanai/ (where benchmark.txt is written).
+        // Resolve the package layout from the editor's own location. rootDir is the
+        // install root (mpv + portable_config + animejanai/ live here); dataDir is
+        // animejanai/ (where benchmark.txt is written).
         public static Paths ResolvePaths(string rootDir, string dataDir) => new()
         {
             Mpv = Path.Combine(rootDir, "mpv"),
@@ -99,8 +113,10 @@ namespace AnimeJaNaiConfEditor.Services
             return null;
         }
 
-        // Run the full benchmark. progress is invoked on the calling context's
-        // thread pool with a short status string (caller marshals to the UI).
+        // Run the full benchmark. progress is invoked with a short status string
+        // (caller marshals to the UI). One clip per resolution, reused across the
+        // two profiles; the resolution loop is outer so the table fills column by
+        // column.
         public static async Task<List<Result>> RunAsync(
             Paths p,
             string backendLabel,
@@ -111,36 +127,45 @@ namespace AnimeJaNaiConfEditor.Services
             var tempFiles = new List<string>();
             try
             {
-                for (var i = 0; i < Resolutions.Length; i++)
+                int cellTotal = Resolutions.Length * Profiles.Length;
+                int cellDone = 0;
+                foreach (var (w, h) in Resolutions)
                 {
                     ct.ThrowIfCancellationRequested();
-                    var (w, h) = Resolutions[i];
-                    progress?.Invoke($"Benchmarking {w}x{h} -> {w * 2}x{h * 2} ({i + 1}/{Resolutions.Length})...");
 
-                    string clip;
+                    string? clip = null;
+                    string? clipErr = null;
                     try
                     {
+                        progress?.Invoke($"Preparing {w}x{h} clip...");
                         clip = await GenerateClipAsync(w, h, ct);
                         tempFiles.Add(clip);
                     }
                     catch (OperationCanceledException) { throw; }
-                    catch (Exception ex)
-                    {
-                        results.Add(new Result { SrcW = w, SrcH = h, Error = $"clip generation failed: {ex.Message}" });
-                        continue;
-                    }
+                    catch (Exception ex) { clipErr = $"clip generation failed: {ex.Message}"; }
 
-                    try
+                    foreach (var (name, slot) in Profiles)
                     {
-                        var (frames, seconds) = await PlayAndTimeAsync(p, clip, ct);
-                        var fps = seconds > 0 ? Math.Round(frames / seconds, 1) : (double?)null;
-                        results.Add(new Result { SrcW = w, SrcH = h, Fps = fps });
-                        progress?.Invoke($"{w}x{h} -> {w * 2}x{h * 2}: {(fps.HasValue ? fps.Value.ToString("0.0", Inv) + " fps" : "no result")}");
-                    }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception ex)
-                    {
-                        results.Add(new Result { SrcW = w, SrcH = h, Error = ex.Message });
+                        ct.ThrowIfCancellationRequested();
+                        cellDone++;
+                        progress?.Invoke($"Benchmarking {name} {w}x{h} -> {w * 2}x{h * 2} ({cellDone}/{cellTotal})...");
+
+                        if (clip is null)
+                        {
+                            results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot, Error = clipErr });
+                            continue;
+                        }
+                        try
+                        {
+                            var fps = await MeasureFpsAsync(p, clip, slot, ct);
+                            results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot, Fps = fps });
+                            progress?.Invoke($"{name} {w}x{h}: {(fps.HasValue ? fps.Value.ToString("0.0", Inv) + " fps" : "no result")}");
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception ex)
+                        {
+                            results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot, Error = ex.Message });
+                        }
                     }
                 }
 
@@ -157,7 +182,8 @@ namespace AnimeJaNaiConfEditor.Services
             }
         }
 
-        // Generate a short synthetic clip (testsrc2, yuv420p h264) to a temp file.
+        // Generate a synthetic clip (testsrc2, yuv420p h264) long enough to supply
+        // the probe + the largest sample without looping.
         private static async Task<string> GenerateClipAsync(int w, int h, CancellationToken ct)
         {
             var ffmpeg = FindFfmpeg() ?? throw new FileNotFoundException("ffmpeg not found on PATH.");
@@ -167,53 +193,86 @@ namespace AnimeJaNaiConfEditor.Services
                 $"-y -nostdin -f lavfi -i testsrc2=size={w}x{h}:rate={ClipFps}:duration={ClipSeconds} " +
                 $"-pix_fmt yuv420p -c:v libx264 -preset ultrafast \"{outPath}\"";
 
-            var (exit, _, stderr) = await RunProcessAsync(ffmpeg, args, workingDir: null, timeout: TimeSpan.FromSeconds(60), ct);
+            var (exit, _, stderr) = await RunProcessAsync(ffmpeg, args, workingDir: null, timeout: TimeSpan.FromSeconds(120), ct);
             if (exit != 0 || !File.Exists(outPath))
                 throw new Exception($"ffmpeg exited {exit}: {Tail(stderr, 200)}");
             return outPath;
         }
 
-        // Play one clip through mpv with the upscale filter and return
-        // (frameCount, wallClockSeconds). The frame count is the known clip
-        // length; wall-clock is measured around the whole process. --vo=null
-        // keeps it offscreen and uncapped so the result is refresh-independent.
-        private static async Task<(double frames, double seconds)> PlayAndTimeAsync(
-            Paths p, string clip, CancellationToken ct)
+        // Steady-state fps for one slot. Runs a short probe (ProbeFrames) and a
+        // longer sample (ProbeFrames + S); the shared init/warm-up cancels in the
+        // difference, so fps = S / (t_sample - t_probe). S is sized from the probe
+        // so the sample lands near SampleSeconds of work regardless of speed.
+        private static async Task<double?> MeasureFpsAsync(Paths p, string clip, int slot, CancellationToken ct)
+        {
+            var vf = BuildVf(p, slot);
+
+            double tProbe = await TimeFramesAsync(p, clip, vf, ProbeFrames, ct);
+            double probeFps = tProbe > 0 ? ProbeFrames / tProbe : 0;
+
+            int s = (int)Math.Round(probeFps * SampleSeconds);
+            s = Math.Clamp(s, SampleFramesMin, SampleFramesMax);
+
+            double tSample = await TimeFramesAsync(p, clip, vf, ProbeFrames + s, ct);
+
+            double dt = tSample - tProbe;
+            if (dt <= 0.0) return null;                 // sample shorter than probe -> unusable
+            return Math.Round(s / dt, 1);
+        }
+
+        // Decode exactly `frames` frames through the upscale filter (offscreen,
+        // uncapped) and return the wall-clock seconds.
+        private static async Task<double> TimeFramesAsync(Paths p, string clip, string vf, int frames, CancellationToken ct)
         {
             var args =
                 $"\"{clip}\" " +
                 $"--config-dir=\"{p.ConfigDir}\" " +
-                "--profile=upscale-on " +
+                $"--vf=\"{vf}\" " +
+                $"--frames={frames} " +
                 "--vo=null --untimed --no-audio --no-cache " +
                 "--keep-open=no --idle=no --force-window=no " +
                 "--msg-level=all=error";
 
             var sw = Stopwatch.StartNew();
             var (exit, _, stderr) = await RunProcessAsync(p.Mpv, args, workingDir: Path.GetDirectoryName(p.Mpv),
-                timeout: TimeSpan.FromSeconds(120), ct);
+                timeout: TimeSpan.FromSeconds(180), ct);
             sw.Stop();
 
             if (exit != 0)
                 throw new Exception($"mpv exited {exit}: {Tail(stderr, 200)}");
+            return sw.Elapsed.TotalSeconds;
+        }
 
-            return (ClipFrames, sw.Elapsed.TotalSeconds);
+        // The aji filter string with the chosen slot, using absolute paths so it is
+        // independent of the conf's default slot. Mirrors the vf in mpv-animejanai.conf.
+        private static string BuildVf(Paths p, int slot)
+        {
+            string lib = Path.Combine(p.DataDir, "inference", "libaji.so");
+            string rife = Path.Combine(p.DataDir, "rife");
+            return $"@aji:animejanai:lib={lib}:conf={p.Conf}:model-dir={p.ModelDir}:rife-model-dir={rife}:slot={slot}";
         }
 
         // Markdown table identical in shape to what benchmark.ps1 writes and
-        // BenchmarkSubmission.FromBenchmarkFile parses. A single row "Vulkan"
-        // (the current backend); cells are fps, or "-" when unmeasured.
+        // BenchmarkSubmission.FromBenchmarkFile parses: resolution columns, one row
+        // per profile.
         private static void WriteBenchmarkTxt(string dataDir, string backendLabel, List<Result> results)
         {
-            var cols = results.Select(r => r.Label).ToArray();
+            var cols = Resolutions.Select(r => $"{r.W}x{r.H}").ToArray();
             var sb = new StringBuilder();
             sb.AppendLine($"AnimeJaNai playback benchmark - backend: {backendLabel}");
             sb.AppendLine();
             sb.AppendLine("|fps|" + string.Join("|", cols) + "|");
             sb.AppendLine("|" + string.Join("|", Enumerable.Repeat("-", cols.Length + 1)) + "|");
 
-            var row = results.Select(r =>
-                r.Fps.HasValue ? r.Fps.Value.ToString("0.0", Inv) : "-");
-            sb.AppendLine("|" + backendLabel + "|" + string.Join("|", row) + "|");
+            foreach (var (name, _) in Profiles)
+            {
+                var cells = Resolutions.Select(res =>
+                {
+                    var r = results.FirstOrDefault(x => x.SrcW == res.W && x.SrcH == res.H && x.Profile == name);
+                    return r?.Fps is { } f ? f.ToString("0.0", Inv) : "-";
+                });
+                sb.AppendLine("|" + name + "|" + string.Join("|", cells) + "|");
+            }
 
             File.WriteAllText(Path.Combine(dataDir, "benchmark.txt"), sb.ToString());
         }
@@ -227,7 +286,6 @@ namespace AnimeJaNaiConfEditor.Services
                 var candidate = Path.Combine(dir, "ffmpeg");
                 if (File.Exists(candidate)) return candidate;
             }
-            // Common fixed locations as a fallback.
             foreach (var candidate in new[] { "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg" })
                 if (File.Exists(candidate)) return candidate;
             return null;
