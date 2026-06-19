@@ -101,6 +101,14 @@ namespace AnimeJaNaiConfEditor.ViewModels
             set => this.RaiseAndSetIfChanged(ref _rocmSelectable, value);
         }
 
+        // Vulkan (Linux/AMD, portable ncnn path) is selectable only when libaji_vk.so shipped.
+        private bool _vulkanSelectable = true;
+        public bool VulkanSelectable
+        {
+            get => _vulkanSelectable;
+            set => this.RaiseAndSetIfChanged(ref _vulkanSelectable, value);
+        }
+
         private string _backendNotice = "";
         public string BackendNotice
         {
@@ -131,21 +139,30 @@ namespace AnimeJaNaiConfEditor.ViewModels
             {
                 bool rocmLib = File.Exists(Path.Combine(DataDir, "inference", "libaji_rocm.so"));
                 bool trtLib  = File.Exists(Path.Combine(DataDir, "inference", "libaji_trt.so"));
+                bool vulkanLib = File.Exists(Path.Combine(DataDir, "inference", "libaji_vk.so"));
                 RocmSelectable = rocmLib;
                 TrtSelectable  = trtLib;
+                VulkanSelectable = vulkanLib;
                 // If the conf points at a backend this install can't run, flip to the one it can
                 // (a conf-only mismatch would otherwise just fail at playback) and say so.
                 string linuxNotice = "";
-                if (AnimeJaNaiConf is { TensorRtSelected: true } && !trtLib && rocmLib)
+                if (AnimeJaNaiConf is { TensorRtSelected: true } && !trtLib && (rocmLib || vulkanLib))
                 {
-                    AnimeJaNaiConf.SetRocmSelected();
-                    linuxNotice = "Switched to ROCm: this build ships the AMD engine, not TensorRT " +
+                    if (rocmLib) AnimeJaNaiConf.SetRocmSelected(); else AnimeJaNaiConf.SetVulkanSelected();
+                    linuxNotice = "Switched to the AMD engine: this build ships it, not TensorRT " +
                                   "(TensorRT is the-database's separate NVIDIA/Linux build).";
                 }
-                else if (AnimeJaNaiConf is { RocmSelected: true } && !rocmLib && trtLib)
+                else if (AnimeJaNaiConf is { RocmSelected: true } && !rocmLib && (vulkanLib || trtLib))
                 {
-                    AnimeJaNaiConf.SetTensorRtSelected();
-                    linuxNotice = "Switched to TensorRT: this build does not include the ROCm (AMD) engine.";
+                    if (vulkanLib) AnimeJaNaiConf.SetVulkanSelected(); else AnimeJaNaiConf.SetTensorRtSelected();
+                    linuxNotice = vulkanLib
+                        ? "Switched to Vulkan: this build ships the portable ncnn engine, not ROCm/MIGraphX."
+                        : "Switched to TensorRT: this build does not include the ROCm (AMD) engine.";
+                }
+                else if (AnimeJaNaiConf is { VulkanSelected: true } && !vulkanLib && (rocmLib || trtLib))
+                {
+                    if (rocmLib) AnimeJaNaiConf.SetRocmSelected(); else AnimeJaNaiConf.SetTensorRtSelected();
+                    linuxNotice = "Switched off Vulkan: the ncnn-Vulkan engine isn't in this build.";
                 }
                 BackendNotice = linuxNotice;
                 RifeMissing = !RifeOnDisk();
@@ -822,6 +839,9 @@ chain_2_rife=no";
                     case Backend.ROCm:
                         animeJaNaiConf.SetRocmSelected();
                         break;
+                    case Backend.Vulkan:
+                        animeJaNaiConf.SetVulkanSelected();
+                        break;
                     case Backend.TensorRT:
                     default:
                         animeJaNaiConf.SetTensorRtSelected();
@@ -1486,6 +1506,20 @@ chain_2_rife=no";
             }
         }
 
+        // ncnn-Vulkan (aji_vk) backend — the PORTABLE Linux/AMD path (no ROCm install
+        // required). Distinct from RocmSelected above (whose backing field is, confusingly,
+        // named _vulkanSelected but is the ROCm/MIGraphX selection).
+        private bool _vulkanBackendSelected = false;
+        [DataMember]
+        public bool VulkanSelected
+        {
+            get => _vulkanBackendSelected;
+            set
+            {
+                this.RaiseAndSetIfChanged(ref _vulkanBackendSelected, value);
+            }
+        }
+
         // Per-profile Standard vs Sharp model selection for the three built-in default profiles.
         // Persisted as [global] quality_preset / balanced_preset / performance_preset and honored at
         // playback by animejanai_config.py (slots 1001/1002/1003). false => standard, true => sharp.
@@ -1667,6 +1701,7 @@ chain_2_rife=no";
             TensorRtSelected = true;
             DirectMlSelected = false;
             RocmSelected = false;
+            VulkanSelected = false;
         }
 
         public void SetDirectMlSelected()
@@ -1674,6 +1709,7 @@ chain_2_rife=no";
             DirectMlSelected = true;
             TensorRtSelected = false;
             RocmSelected = false;
+            VulkanSelected = false;
         }
 
         public void SetRocmSelected()
@@ -1681,6 +1717,15 @@ chain_2_rife=no";
             RocmSelected = true;
             TensorRtSelected = false;
             DirectMlSelected = false;
+            VulkanSelected = false;
+        }
+
+        public void SetVulkanSelected()
+        {
+            VulkanSelected = true;
+            TensorRtSelected = false;
+            DirectMlSelected = false;
+            RocmSelected = false;
         }
 
         public void UserSelectTensorRt()
@@ -1701,6 +1746,12 @@ chain_2_rife=no";
             SetRocmSelected();
         }
 
+        public void UserSelectVulkan()
+        {
+            BackendAutoFallback = false;
+            SetVulkanSelected();
+        }
+
         private bool _backendAutoFallback;
         [DataMember]
         public bool BackendAutoFallback
@@ -1710,6 +1761,7 @@ chain_2_rife=no";
         }
 
         public Backend SelectedBackend =>
+            VulkanSelected ? Backend.Vulkan :
             RocmSelected ? Backend.ROCm :
             DirectMlSelected ? Backend.DirectML :
             Backend.TensorRT;
@@ -2084,6 +2136,7 @@ chain_2_rife=no";
         TensorRT,
         DirectML,
         NCNN,
-        ROCm    // Linux/AMD: MIGraphX via aji_rocm.
+        ROCm,   // Linux/AMD: MIGraphX via aji_rocm.
+        Vulkan  // Linux/AMD: ncnn-Vulkan via aji_vk (portable; no ROCm install required).
     }
 }
