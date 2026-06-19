@@ -20,10 +20,14 @@ namespace AnimeJaNaiConfEditor.Services
     //     resolution. (The regular slots 1001-1003 are resolution-conditional and
     //     fall to the SD model below 720p, which is NOT what the catalog measures.)
     //   - Same source resolutions as the Windows clip set.
-    //   - Excludes warm-up: ncnn has no TensorRT-style engine build, but the first
-    //     frames still pay pipeline creation + GPU clock ramp. A short probe run and
-    //     a longer sample run are timed; the steady-state fps is the extra sample
-    //     frames divided by the extra wall-clock (the shared init/warm-up cancels).
+    //   - MIGraphX compiles a per-(model, resolution) engine on first use. The compile
+    //     is async (the filter defers it and plays passthrough meanwhile) and can take a
+    //     few minutes at 4K, so EACH cell is first warmed up: the clip is played until
+    //     the stats log shows the engine active (compile done + cached), with progress
+    //     reported so the UI isn't frozen. Only THEN is fps timed, on the cached engine.
+    //   - The timed measurement excludes warm-up: a short probe run and a longer sample
+    //     run are timed; the steady-state fps is the extra sample frames divided by the
+    //     extra wall-clock (the shared pipeline-init/GPU-clock-ramp cost cancels).
     //
     // Writes benchmark.txt in the markdown-table shape the Submit-to-Catalog parser
     // (BenchmarkSubmission.FromBenchmarkFile) expects: resolution columns, one row
@@ -62,6 +66,15 @@ namespace AnimeJaNaiConfEditor.Services
         private const int SampleSeconds = 5;         // target steady-state sample length
         private const int SampleFramesMin = 120;
         private const int SampleFramesMax = 600;
+        // Max wait for a first-play engine compile before giving up on a cell. The MIGraphX
+        // compile is ~tens of seconds at low res and a few minutes at 4K (with MLIR on); 900s
+        // leaves generous headroom for slower GPUs without hanging the benchmark forever.
+        private const int CompileWaitSeconds = 900;
+        // Skip a cell (and every larger resolution for that profile) once it can't sustain this
+        // many fps — matching benchmark.ps1. Well below the ~24 fps real-time bar, so the exact
+        // value doesn't matter; it avoids compiling a multi-minute 4K engine for a profile that
+        // is already hopeless at a smaller resolution.
+        private const double FpsFloor = 6.0;
 
         public sealed class Result
         {
@@ -101,7 +114,7 @@ namespace AnimeJaNaiConfEditor.Services
         public static string? CheckPrerequisites(Paths p)
         {
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return "The Vulkan benchmark only runs on Linux.";
+                return "The ROCm benchmark only runs on Linux.";
             if (!File.Exists(p.Mpv))
                 return $"The bundled mpv was not found at {p.Mpv}.";
             if (!File.Exists(p.Conf))
@@ -125,10 +138,17 @@ namespace AnimeJaNaiConfEditor.Services
         {
             var results = new List<Result>();
             var tempFiles = new List<string>();
+            // Shared stats-log the filter writes its compile/active status to (reused per
+            // cell; the warm-up truncates it before each engine compile).
+            var statsPath = Path.Combine(Path.GetTempPath(), $"animejanai_bench_stats_{Guid.NewGuid():N}.log");
+            tempFiles.Add(statsPath);
             try
             {
                 int cellTotal = Resolutions.Length * Profiles.Length;
                 int cellDone = 0;
+                // Profiles that already fell below the fps floor at a smaller resolution; every
+                // larger resolution for them is skipped without compiling/running (ascending res).
+                var tooSlow = new HashSet<string>();
                 foreach (var (w, h) in Resolutions)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -148,6 +168,16 @@ namespace AnimeJaNaiConfEditor.Services
                     {
                         ct.ThrowIfCancellationRequested();
                         cellDone++;
+
+                        // A smaller resolution for this profile already fell below the floor; a
+                        // larger one can only be slower, so skip it without compiling or running.
+                        if (tooSlow.Contains(name))
+                        {
+                            results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot });
+                            progress?.Invoke($"{name} {w}x{h}: skipped (a smaller resolution was already too slow)");
+                            continue;
+                        }
+
                         progress?.Invoke($"Benchmarking {name} {w}x{h} -> {w * 2}x{h * 2} ({cellDone}/{cellTotal})...");
 
                         if (clip is null)
@@ -157,9 +187,19 @@ namespace AnimeJaNaiConfEditor.Services
                         }
                         try
                         {
-                            var fps = await MeasureFpsAsync(p, clip, slot, ct);
-                            results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot, Fps = fps });
-                            progress?.Invoke($"{name} {w}x{h}: {(fps.HasValue ? fps.Value.ToString("0.0", Inv) + " fps" : "no result")}");
+                            var fps = await MeasureFpsAsync(p, clip, slot, statsPath, $"{name} {w}x{h}", progress, ct);
+                            if (fps.HasValue && fps.Value < FpsFloor)
+                            {
+                                // too slow to be usable: record "-" and skip every larger resolution
+                                tooSlow.Add(name);
+                                results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot });
+                                progress?.Invoke($"{name} {w}x{h}: {fps.Value.ToString("0.0", Inv)} fps — skipped (under {FpsFloor:0} fps)");
+                            }
+                            else
+                            {
+                                results.Add(new Result { SrcW = w, SrcH = h, Profile = name, Slot = slot, Fps = fps });
+                                progress?.Invoke($"{name} {w}x{h}: {(fps.HasValue ? fps.Value.ToString("0.0", Inv) + " fps" : "no result")}");
+                            }
                         }
                         catch (OperationCanceledException) { throw; }
                         catch (Exception ex)
@@ -203,9 +243,14 @@ namespace AnimeJaNaiConfEditor.Services
         // longer sample (ProbeFrames + S); the shared init/warm-up cancels in the
         // difference, so fps = S / (t_sample - t_probe). S is sized from the probe
         // so the sample lands near SampleSeconds of work regardless of speed.
-        private static async Task<double?> MeasureFpsAsync(Paths p, string clip, int slot, CancellationToken ct)
+        private static async Task<double?> MeasureFpsAsync(Paths p, string clip, int slot,
+            string statsPath, string label, Action<string>? progress, CancellationToken ct)
         {
-            var vf = BuildVf(p, slot);
+            var vf = BuildVf(p, slot, statsPath);
+
+            // Compile + cache the engine first (async, minutes at 4K), so the timed runs
+            // below measure the model on the cached engine, not passthrough during compile.
+            await EnsureCompiledAsync(p, clip, vf, statsPath, label, progress, ct);
 
             double tProbe = await TimeFramesAsync(p, clip, vf, ProbeFrames, ct);
             double probeFps = tProbe > 0 ? ProbeFrames / tProbe : 0;
@@ -226,7 +271,12 @@ namespace AnimeJaNaiConfEditor.Services
         {
             var args =
                 $"\"{clip}\" " +
-                $"--config-dir=\"{p.ConfigDir}\" " +
+                // --load-scripts=no (matching the Windows benchmark): the player's lua scripts
+                // re-apply default_slot on file-loaded (and the engine-monitor pauses playback),
+                // which would override the benchmark's slot=N and silently measure the default
+                // slot instead. Keep the config for mpv.conf parity but drop the scripts;
+                // --hwdec=no explicitly since backend.lua (which sets it) no longer runs.
+                $"--config-dir=\"{p.ConfigDir}\" --load-scripts=no --hwdec=no " +
                 $"--vf=\"{vf}\" " +
                 $"--frames={frames} " +
                 "--vo=null --untimed --no-audio --no-cache " +
@@ -243,13 +293,100 @@ namespace AnimeJaNaiConfEditor.Services
             return sw.Elapsed.TotalSeconds;
         }
 
+        // Ensure the MIGraphX engine for this vf (slot + resolution) is compiled and cached
+        // before timing, so the timed runs measure the model rather than passthrough during
+        // the compile. The compile is async: on first play the filter defers it (playing
+        // passthrough) and writes "Building MIGraphX engine ..." to the stats log, then the
+        // active "... -> ..." chain once it finishes (~tens of seconds at low res, a few
+        // minutes at 4K). A cached engine activates immediately. Plays the clip looped +
+        // offscreen and polls the stats log, reporting progress; throws on build failure or
+        // after CompileWaitSeconds.
+        private static async Task EnsureCompiledAsync(Paths p, string clip, string vf, string statsPath,
+            string label, Action<string>? progress, CancellationToken ct)
+        {
+            try { File.WriteAllText(statsPath, string.Empty); } catch { /* best effort */ }
+
+            var args =
+                $"\"{clip}\" " +
+                // --load-scripts=no (matching the Windows benchmark): same reason as the timed
+                // runs — the player scripts would re-apply default_slot and override slot=N, and
+                // the engine-monitor would pause playback. We watch the stats log directly.
+                $"--config-dir=\"{p.ConfigDir}\" --load-scripts=no --hwdec=no " +
+                $"--vf=\"{vf}\" " +
+                "--vo=null --no-audio --no-cache --loop-file=inf " +
+                "--msg-level=all=error";
+
+            using var proc = StartProcess(p.Mpv, args, Path.GetDirectoryName(p.Mpv));
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (proc.HasExited)
+                        throw new Exception($"mpv exited ({proc.ExitCode}) before the engine was ready.");
+
+                    string stats = SafeRead(statsPath);
+                    if (stats.Contains("->")) return;                 // active chain => engine ready
+                    if (stats.Contains("FAILED"))
+                        throw new Exception("MIGraphX engine build failed.");
+                    if (stats.Contains("Building"))
+                        progress?.Invoke($"Compiling {label} engine (first run, up to a few minutes)... {sw.Elapsed.TotalSeconds:0}s");
+
+                    if (sw.Elapsed.TotalSeconds > CompileWaitSeconds)
+                        throw new TimeoutException($"engine compile for {label} exceeded {CompileWaitSeconds}s.");
+
+                    await Task.Delay(1000, ct);
+                }
+            }
+            finally
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { /* ignore */ }
+            }
+        }
+
+        // Start a process without waiting for exit; stdout/stderr are drained + discarded
+        // (we watch the stats file instead). Caller owns disposal/kill.
+        private static Process StartProcess(string fileName, string args, string? workingDir)
+        {
+            var process = new Process();
+            process.StartInfo.FileName = fileName;
+            process.StartInfo.Arguments = args;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.StartInfo.RedirectStandardError = true;
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.CreateNoWindow = true;
+            if (!string.IsNullOrEmpty(workingDir)) process.StartInfo.WorkingDirectory = workingDir;
+            process.OutputDataReceived += (_, __) => { };
+            process.ErrorDataReceived += (_, __) => { };
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            return process;
+        }
+
+        // Read a file another process is concurrently writing (shared read+write).
+        private static string SafeRead(string path)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var sr = new StreamReader(fs);
+                return sr.ReadToEnd();
+            }
+            catch { return string.Empty; }
+        }
+
         // The aji filter string with the chosen slot, using absolute paths so it is
         // independent of the conf's default slot. Mirrors the vf in mpv-animejanai.conf.
-        private static string BuildVf(Paths p, int slot)
+        // stats= makes the filter write its status (the "Building MIGraphX engine ..."
+        // marker while compiling, the active "... -> ..." chain once ready) so the warm-up
+        // can detect when the engine is compiled and cached.
+        private static string BuildVf(Paths p, int slot, string statsPath)
         {
             string lib = Path.Combine(p.DataDir, "inference", "libaji.so");
             string rife = Path.Combine(p.DataDir, "rife");
-            return $"@aji:animejanai:lib={lib}:conf={p.Conf}:model-dir={p.ModelDir}:rife-model-dir={rife}:slot={slot}";
+            return $"@aji:animejanai:lib={lib}:conf={p.Conf}:model-dir={p.ModelDir}:rife-model-dir={rife}:stats={statsPath}:slot={slot}";
         }
 
         // Markdown table identical in shape to what benchmark.ps1 writes and
