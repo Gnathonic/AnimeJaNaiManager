@@ -23,22 +23,20 @@ namespace AnimeJaNaiConfEditor.ViewModels
 
         public static MainWindowViewModel? Instance { get; private set; }
 
-        // Platform gate: Windows-only paths (TensorRT/DirectML auto-flip, nvinfer probing,
-        // benchmark .bat, explorer.exe, the Components tab) are guarded behind this so the
-        // Vulkan/Linux build never trips over them. Bound from XAML too.
+        // Platform gate: Windows-only paths (TensorRT/DirectML auto-flip, benchmark .bat,
+        // explorer.exe) are guarded behind this so the Vulkan/Linux build never trips over
+        // them. The Components tab runs on both platforms (the updater is cross-platform).
+        // Bound from XAML too.
         public static bool IsWindows { get; } = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
         // Convenience inverse for XAML visibility (Vulkan toggle, Linux-only panels) — Avalonia
         // x:Static can't negate, so expose the complement directly.
         public static bool IsNotWindows { get; } = !IsWindows;
 
-        // RIFE-missing notice text, per platform. On Windows the models come from the
-        // Components tab; on Linux RIFE interpolation isn't wired up yet (planned), so the
-        // Windows "install from the Components tab" instruction would be a dead end (that
-        // tab is Windows-only and there's no updater on Linux).
-        public static string RifeMissingText { get; } = IsWindows
-            ? "RIFE models are not installed. Install them from the Components tab to use interpolation."
-            : "RIFE interpolation is coming to Linux in a future update.";
+        // RIFE-missing notice text. The models install from the Components tab on both
+        // platforms (the same rife pack; ROCm/TensorRT run the .onnx, Vulkan the ncnn pairs).
+        public static string RifeMissingText { get; } =
+            "RIFE models are not installed. Install them from the Components tab to use interpolation.";
 
         public MainWindowViewModel()
         {
@@ -61,15 +59,15 @@ namespace AnimeJaNaiConfEditor.ViewModels
             InitializeSelectedSlot();
 
             RefreshComponentAwareness();
-            if (IsWindows)
+            // The updater-driven Components flow (pack list, first-run setup offer) is
+            // cross-platform: the updater ships as AnimeJaNaiUpdater.exe / extensionless
+            // AnimeJaNaiUpdater and resolves its platform's release assets itself.
+            ComponentManager.Refreshed += RefreshComponentAwareness;
+            _ = InitializeComponentManagerAsync();
+            if (!IsWindows)
             {
-                ComponentManager.Refreshed += RefreshComponentAwareness;
-                _ = InitializeComponentManagerAsync();
-            }
-            else
-            {
-                // Linux uses the native readiness/setup tab (LinuxSetup) instead of
-                // the Windows updater-driven Components flow.
+                // Linux additionally has the native readiness panel for the system
+                // pieces no pack can install (ROCm/MIGraphX, GPU driver state).
                 LinuxSetup.Refreshed += RefreshComponentAwareness;
                 LinuxSetup.Refresh();
             }
@@ -80,7 +78,8 @@ namespace AnimeJaNaiConfEditor.ViewModels
         // component engine once its refresh completes.
 
         public static bool TrtOnDisk() =>
-            File.Exists(Path.Combine(DataDir, "inference", "nvinfer_11.dll"));
+            File.Exists(Path.Combine(DataDir, "inference", "nvinfer_11.dll")) ||
+            File.Exists(Path.Combine(DataDir, "inference", "libnvinfer.so.11"));
 
         public static bool RifeOnDisk() =>
             Directory.Exists(Path.Combine(DataDir, "rife")) &&
