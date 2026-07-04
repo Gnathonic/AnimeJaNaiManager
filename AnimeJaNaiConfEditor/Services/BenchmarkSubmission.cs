@@ -132,19 +132,21 @@ namespace AnimeJaNaiConfEditor.Services
         {
             AppVersion = ReadAppVersion(animejanaiDir);
             Os = RuntimeInformation.OSDescription;
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-            {
-                // Linux/AMD: gather from /proc, /sys, lspci and the ROCm install
-                // (the WMI/DXGI/nvidia-smi trio below is Windows-only and would
-                // leave every hardware field blank here).
-                try { GatherFromLinux(); } catch { /* leave blank */ }
-            }
-            else
+            if (OperatingSystem.IsWindows())
             {
                 try { GatherFromWmi(); } catch { /* WMI unavailable: leave blank */ }
                 TryFillDxgiMemory();
-                TryFillNvidia();
             }
+            else
+            {
+                // Linux: gather from /proc, /sys, lspci and the ROCm install —
+                // fills the AMD GPU/VRAM/driver-stack fields the nvidia-smi probe
+                // below can't (DXGI has no Linux equivalent).
+                try { GatherFromLinux(); } catch { /* leave blank */ }
+            }
+            // nvidia-smi works on both platforms; on NVIDIA it is the
+            // authoritative GPU identity, elsewhere it no-ops.
+            TryFillNvidia();
             TryFillKnownGpuSpecs();
         }
 
