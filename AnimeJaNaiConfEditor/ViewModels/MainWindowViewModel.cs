@@ -32,6 +32,9 @@ namespace AnimeJaNaiConfEditor.ViewModels
         // Convenience inverse for XAML visibility (Vulkan toggle, Linux-only panels) — Avalonia
         // x:Static can't negate, so expose the complement directly.
         public static bool IsNotWindows { get; } = !IsWindows;
+        public static bool IsMacOS { get; } = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+        public static bool IsLinux { get; } = !IsWindows && !IsMacOS;
+        public static bool IsNotMacOS { get; } = !IsMacOS;
 
         // RIFE-missing notice text. The models install from the Components tab on both
         // platforms (the same rife pack; ROCm/TensorRT run the .onnx, Vulkan the ncnn pairs).
