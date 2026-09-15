@@ -384,7 +384,7 @@ namespace AnimeJaNaiConfEditor.Services
         // can detect when the engine is compiled and cached.
         private static string BuildVf(Paths p, int slot, string statsPath)
         {
-            string lib = Path.Combine(p.DataDir, "inference", "libaji.so");
+            string lib = Path.Combine(p.DataDir, "inference", AnimeJaNaiConfEditor.ViewModels.MainWindowViewModel.NativeLib("aji"));
             string rife = Path.Combine(p.DataDir, "rife");
             return $"@aji:animejanai:lib={lib}:conf={p.Conf}:model-dir={p.ModelDir}:rife-model-dir={rife}:stats={statsPath}:slot={slot}";
         }

@@ -19,7 +19,7 @@ namespace AnimeJaNaiConfEditor.ViewModels
             "https://github.com/the-database/animejanai-inference/releases/download/models-rife-fp16-1/rife-fp16-1.7z";
         const long RifeBytes = 322142263;
 
-        static string EngineLib => Path.Combine(MainWindowViewModel.DataDir, "inference", "libaji_rocm.so");
+        static string EngineLib => Path.Combine(MainWindowViewModel.DataDir, "inference", MainWindowViewModel.NativeLib("aji_rocm"));
         static string RifeDir => Path.Combine(MainWindowViewModel.DataDir, "rife");
 
         // Fired after a refresh or a successful RIFE install so the rest of the UI

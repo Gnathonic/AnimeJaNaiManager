@@ -100,7 +100,13 @@ namespace AnimeJaNaiConfEditor.ViewModels
             set => this.RaiseAndSetIfChanged(ref _rocmSelectable, value);
         }
 
-        // Vulkan (Linux/AMD, portable ncnn path) is selectable only when libaji_vk.so shipped.
+        // Engine backend library name for this OS: lib<stem>.so on Linux, lib<stem>.dylib on
+        // macOS (Windows uses <stem>.dll and never reaches these checks).
+        public static string NativeLib(string stem) =>
+            OperatingSystem.IsMacOS() ? $"lib{stem}.dylib" : $"lib{stem}.so";
+
+        // Vulkan (Linux/AMD + macOS/MoltenVK, portable ncnn path) is selectable only when
+        // the aji_vk library shipped.
         private bool _vulkanSelectable = true;
         public bool VulkanSelectable
         {
@@ -136,9 +142,9 @@ namespace AnimeJaNaiConfEditor.ViewModels
             // option and why it's unavailable). DirectML is Windows-only and not shown here.
             if (!IsWindows)
             {
-                bool rocmLib = File.Exists(Path.Combine(DataDir, "inference", "libaji_rocm.so"));
-                bool trtLib  = File.Exists(Path.Combine(DataDir, "inference", "libaji_trt.so"));
-                bool vulkanLib = File.Exists(Path.Combine(DataDir, "inference", "libaji_vk.so"));
+                bool rocmLib = File.Exists(Path.Combine(DataDir, "inference", NativeLib("aji_rocm")));
+                bool trtLib  = File.Exists(Path.Combine(DataDir, "inference", NativeLib("aji_trt")));
+                bool vulkanLib = File.Exists(Path.Combine(DataDir, "inference", NativeLib("aji_vk")));
                 RocmSelectable = rocmLib;
                 TrtSelectable  = trtLib;
                 VulkanSelectable = vulkanLib;
