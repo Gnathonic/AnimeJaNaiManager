@@ -72,6 +72,7 @@ namespace AnimeJaNaiConfEditor.Services
 
         static readonly JsonSerializerOptions PreviewOpts = new() { WriteIndented = true };
 
+        [JsonIgnore]
         public bool HasResults => Results.Values.Any(r => r.Count > 0);
 
         public string ToPreviewJson() => JsonSerializer.Serialize(this, PreviewOpts);
@@ -134,12 +135,21 @@ namespace AnimeJaNaiConfEditor.Services
             if (OperatingSystem.IsWindows())
             {
                 try { GatherFromWmi(); } catch { /* WMI unavailable: leave blank */ }
+                TryFillDxgiMemory();
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                try { GatherFromMac(); } catch { /* leave blank */ }
             }
             else
             {
-                try { GatherFromProc(); } catch { /* /proc unavailable: leave blank */ }
+                // Linux: gather from /proc, /sys, lspci and the ROCm install —
+                // fills the AMD GPU/VRAM/driver-stack fields the nvidia-smi probe
+                // below can't (DXGI has no Linux equivalent).
+                try { GatherFromLinux(); } catch { /* leave blank */ }
             }
-            TryFillDxgiMemory();
+            // nvidia-smi works on both platforms; on NVIDIA it is the
+            // authoritative GPU identity, elsewhere it no-ops.
             TryFillNvidia();
             TryFillKnownGpuSpecs();
         }
@@ -285,27 +295,81 @@ namespace AnimeJaNaiConfEditor.Services
             }
         }
 
-        // Linux equivalent of GatherFromWmi for CPU/RAM (the GPU comes from
-        // nvidia-smi via TryFillNvidia, same as Windows). RAM speed needs
-        // dmidecode/root, so it's left blank.
-        void GatherFromProc()
+        // Linux hardware/software context, mirroring the Windows WMI/DXGI/nvidia-smi
+        // path but sourced from /proc, /sys, lspci and the ROCm install. Best-effort:
+        // every read is independently guarded so a missing file or absent tool just
+        // leaves that field blank (same contract as the Windows path). The "driver"
+        // field carries the AMD compute stack (ROCm + MIGraphX) — that is the driver
+        // that actually governs inference performance on this backend.
+        // macOS: sysctl for CPU/RAM, system_profiler for the GPU, sw_vers for the OS.
+        // Apple silicon shares memory between CPU and GPU, so vram_mb is left blank.
+        void GatherFromMac()
         {
-            var cpuinfo = File.ReadAllText("/proc/cpuinfo");
-            var model = Regex.Match(cpuinfo, @"model name\s*:\s*(.+)");
-            if (model.Success) Cpu = model.Groups[1].Value.Trim();
-            CpuThreads = Regex.Matches(cpuinfo, @"(?m)^processor\s*:").Count;
-            var cores = Regex.Match(cpuinfo, @"cpu cores\s*:\s*(\d+)");
-            CpuCores = cores.Success ? int.Parse(cores.Groups[1].Value, CultureInfo.InvariantCulture)
-                                     : CpuThreads;
-            var mhz = Regex.Match(cpuinfo, @"cpu MHz\s*:\s*([\d.]+)");
-            if (mhz.Success &&
-                double.TryParse(mhz.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m))
-                CpuMhz = (int)Math.Round(m);
+            static string Sysctl(string key) => LinuxSystemInfo.RunTool("sysctl", "-n " + key).Trim();
+            var cpu = Sysctl("machdep.cpu.brand_string");
+            if (cpu.Length > 0) Cpu = cpu;
+            if (int.TryParse(Sysctl("hw.physicalcpu"), out var cores)) CpuCores = cores;
+            if (int.TryParse(Sysctl("hw.ncpu"), out var threads)) CpuThreads = threads;
+            if (long.TryParse(Sysctl("hw.memsize"), out var bytes)) RamMb = bytes / 1048576;
+            var ver = LinuxSystemInfo.RunTool("sw_vers", "-productVersion").Trim();
+            if (ver.Length > 0) Os = "macOS " + ver;
+            var prof = LinuxSystemInfo.RunTool("system_profiler", "SPDisplaysDataType");
+            var m = Regex.Match(prof, @"Chipset Model:\s*(.+)");
+            if (m.Success) Gpu = m.Groups[1].Value.Trim();
+            Driver = "Metal via MoltenVK";
+        }
 
-            var memTotal = Regex.Match(File.ReadAllText("/proc/meminfo"), @"MemTotal:\s*(\d+)\s*kB");
-            if (memTotal.Success &&
-                long.TryParse(memTotal.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var kb))
+        void GatherFromLinux()
+        {
+            // GPU + the AMD compute driver stack ("ROCm X / MIGraphX Y") come from
+            // the shared detector.
+            var gpu = LinuxSystemInfo.GpuName();
+            if (gpu.Length > 0) Gpu = gpu;
+            var stack = LinuxSystemInfo.DriverStack();
+            if (stack.Length > 0) Driver = stack;
+
+            // VRAM: total dedicated VRAM from amdgpu sysfs (bytes -> MB).
+            foreach (var card in LinuxSystemInfo.SafeDirs("/sys/class/drm", "card*"))
+            {
+                var f = Path.Combine(card, "device", "mem_info_vram_total");
+                if (long.TryParse(LinuxSystemInfo.SafeReadText(f).Trim(), out var bytes) && bytes > 0)
+                {
+                    VramMb = (long)Math.Round(bytes / 1048576.0);
+                    break;
+                }
+            }
+
+            // CPU: model + core/thread counts from /proc/cpuinfo; rated max clock
+            // from cpufreq (the live "cpu MHz" fluctuates, so prefer cpuinfo_max_freq).
+            var cpuinfo = LinuxSystemInfo.SafeReadText("/proc/cpuinfo");
+            if (cpuinfo.Length > 0)
+            {
+                var name = Regex.Match(cpuinfo, @"^model name\s*:\s*(.+)$", RegexOptions.Multiline);
+                if (name.Success) Cpu = name.Groups[1].Value.Trim();
+                CpuThreads = Regex.Matches(cpuinfo, @"^processor\s*:", RegexOptions.Multiline).Count;
+                var cores = Regex.Match(cpuinfo, @"^cpu cores\s*:\s*(\d+)$", RegexOptions.Multiline);
+                if (cores.Success && int.TryParse(cores.Groups[1].Value, out var c) && c > 0) CpuCores = c;
+            }
+            var maxKhz = LinuxSystemInfo.SafeReadText("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq").Trim();
+            if (int.TryParse(maxKhz, out var khz) && khz > 0)
+                CpuMhz = (int)Math.Round(khz / 1000.0);
+            else
+            {
+                var live = Regex.Match(cpuinfo, @"^cpu MHz\s*:\s*([\d.]+)$", RegexOptions.Multiline);
+                if (live.Success && double.TryParse(live.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var mhz))
+                    CpuMhz = (int)Math.Round(mhz);
+            }
+
+            // RAM: MemTotal (kB) -> MB.
+            var mem = Regex.Match(LinuxSystemInfo.SafeReadText("/proc/meminfo"), @"^MemTotal:\s*(\d+)\s*kB", RegexOptions.Multiline);
+            if (mem.Success && long.TryParse(mem.Groups[1].Value, out var kb) && kb > 0)
                 RamMb = (long)Math.Round(kb / 1024.0);
+
+            // OS: distro PRETTY_NAME (+ kernel release) instead of the raw uname blob.
+            var pretty = Regex.Match(LinuxSystemInfo.SafeReadText("/etc/os-release"), "^PRETTY_NAME=\"?(.*?)\"?$", RegexOptions.Multiline);
+            var kernel = LinuxSystemInfo.SafeReadText("/proc/sys/kernel/osrelease").Trim();
+            if (pretty.Success && pretty.Groups[1].Value.Length > 0)
+                Os = kernel.Length > 0 ? $"{pretty.Groups[1].Value} (kernel {kernel})" : pretty.Groups[1].Value;
         }
 
         static long ToLong(object? value)

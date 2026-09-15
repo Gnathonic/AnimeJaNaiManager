@@ -69,8 +69,11 @@ namespace AnimeJaNaiConfEditor.ViewModels
     // owns all pack logic (release lookup, NVML GPU detection, components.json bookkeeping).
     public class ComponentManagerViewModel : ViewModelBase
     {
+        // Windows ships AnimeJaNaiUpdater.exe; Linux the extensionless binary
+        // (same pattern animejanai_update.lua uses to launch it from the player).
         public static string UpdaterPath { get; } =
-            Path.Combine(MainWindowViewModel.RootDir, "AnimeJaNaiUpdater.exe");
+            Path.Combine(MainWindowViewModel.RootDir,
+                OperatingSystem.IsWindows() ? "AnimeJaNaiUpdater.exe" : "AnimeJaNaiUpdater");
 
         public bool UpdaterFound => File.Exists(UpdaterPath);
 
@@ -133,7 +136,7 @@ namespace AnimeJaNaiConfEditor.ViewModels
         {
             if (!UpdaterFound)
             {
-                GpuText = "AnimeJaNaiUpdater.exe not found next to the install - component management unavailable.";
+                GpuText = $"{Path.GetFileName(UpdaterPath)} not found next to the install - component management unavailable.";
                 LoadFailed = true;
                 return;
             }

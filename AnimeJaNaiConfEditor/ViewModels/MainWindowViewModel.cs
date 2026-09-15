@@ -1,4 +1,5 @@
-﻿using Avalonia.Collections;
+﻿using AnimeJaNaiConfEditor.Services;
+using Avalonia.Collections;
 using ReactiveUI;
 using Salaros.Configuration;
 using System;
@@ -8,6 +9,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
+using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -20,6 +22,24 @@ namespace AnimeJaNaiConfEditor.ViewModels
         private static readonly CultureInfo ENGLISH_CULTURE = CultureInfo.GetCultureInfo("en-US");
 
         public static MainWindowViewModel? Instance { get; private set; }
+
+        // Platform gate: Windows-only paths (TensorRT/DirectML auto-flip, benchmark .bat,
+        // explorer.exe) are guarded behind this so the Vulkan/Linux build never trips over
+        // them. The Components tab runs on both platforms (the updater is cross-platform).
+        // Bound from XAML too.
+        public static bool IsWindows { get; } = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+        // Convenience inverse for XAML visibility (Vulkan toggle, Linux-only panels) — Avalonia
+        // x:Static can't negate, so expose the complement directly.
+        public static bool IsNotWindows { get; } = !IsWindows;
+        public static bool IsMacOS { get; } = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+        public static bool IsLinux { get; } = !IsWindows && !IsMacOS;
+        public static bool IsNotMacOS { get; } = !IsMacOS;
+
+        // RIFE-missing notice text. The models install from the Components tab on both
+        // platforms (the same rife pack; ROCm/TensorRT run the .onnx, Vulkan the ncnn pairs).
+        public static string RifeMissingText { get; } =
+            "RIFE models are not installed. Install them from the Components tab to use interpolation.";
 
         public MainWindowViewModel()
         {
@@ -42,8 +62,19 @@ namespace AnimeJaNaiConfEditor.ViewModels
             InitializeSelectedSlot();
 
             RefreshComponentAwareness();
+            // The updater-driven Components flow (pack list, first-run setup offer) is
+            // cross-platform: the updater ships as AnimeJaNaiUpdater.exe / extensionless
+            // AnimeJaNaiUpdater and resolves its platform's release assets itself.
             ComponentManager.Refreshed += RefreshComponentAwareness;
             _ = InitializeComponentManagerAsync();
+            if (IsLinux)
+            {
+                // Linux additionally has the native readiness panel for the system
+                // pieces no pack can install (ROCm/MIGraphX, GPU driver state).
+                // macOS has no such pieces (Vulkan/MoltenVK ships in the package).
+                LinuxSetup.Refreshed += RefreshComponentAwareness;
+                LinuxSetup.Refresh();
+            }
         }
 
         // ---- component awareness for the Profiles tab -------------------------------------
@@ -51,7 +82,8 @@ namespace AnimeJaNaiConfEditor.ViewModels
         // component engine once its refresh completes.
 
         public static bool TrtOnDisk() =>
-            File.Exists(Path.Combine(DataDir, "inference", "nvinfer_11.dll"));
+            File.Exists(Path.Combine(DataDir, "inference", "nvinfer_11.dll")) ||
+            File.Exists(Path.Combine(DataDir, "inference", "libnvinfer.so.11"));
 
         public static bool RifeOnDisk() =>
             Directory.Exists(Path.Combine(DataDir, "rife")) &&
@@ -62,6 +94,28 @@ namespace AnimeJaNaiConfEditor.ViewModels
         {
             get => _trtSelectable;
             set => this.RaiseAndSetIfChanged(ref _trtSelectable, value);
+        }
+
+        // ROCm (Linux/AMD) is selectable only when its engine library shipped in this install.
+        private bool _rocmSelectable = true;
+        public bool RocmSelectable
+        {
+            get => _rocmSelectable;
+            set => this.RaiseAndSetIfChanged(ref _rocmSelectable, value);
+        }
+
+        // Engine backend library name for this OS: lib<stem>.so on Linux, lib<stem>.dylib on
+        // macOS (Windows uses <stem>.dll and never reaches these checks).
+        public static string NativeLib(string stem) =>
+            OperatingSystem.IsMacOS() ? $"lib{stem}.dylib" : $"lib{stem}.so";
+
+        // Vulkan (Linux/AMD + macOS/MoltenVK, portable ncnn path) is selectable only when
+        // the aji_vk library shipped.
+        private bool _vulkanSelectable = true;
+        public bool VulkanSelectable
+        {
+            get => _vulkanSelectable;
+            set => this.RaiseAndSetIfChanged(ref _vulkanSelectable, value);
         }
 
         private string _backendNotice = "";
@@ -86,6 +140,53 @@ namespace AnimeJaNaiConfEditor.ViewModels
 
         public void RefreshComponentAwareness()
         {
+            // Linux backends: ROCm (AMD, ours) and TensorRT (NVIDIA, the-database's build).
+            // Each backend is shown but selectable only when its engine library shipped in this
+            // install (the toggle carries a requirement tooltip either way, so the user sees the
+            // option and why it's unavailable). DirectML is Windows-only and not shown here.
+            if (!IsWindows)
+            {
+                bool rocmLib = File.Exists(Path.Combine(DataDir, "inference", NativeLib("aji_rocm")));
+                bool trtLib  = File.Exists(Path.Combine(DataDir, "inference", NativeLib("aji_trt")));
+                bool vulkanLib = File.Exists(Path.Combine(DataDir, "inference", NativeLib("aji_vk")));
+                RocmSelectable = rocmLib;
+                TrtSelectable  = trtLib;
+                VulkanSelectable = vulkanLib;
+                // If the conf points at a backend this install can't run, flip to the one it can
+                // (a conf-only mismatch would otherwise just fail at playback) and say so.
+                string linuxNotice = "";
+                if (AnimeJaNaiConf is { TensorRtSelected: true } && !trtLib && (rocmLib || vulkanLib))
+                {
+                    if (rocmLib) AnimeJaNaiConf.SetRocmSelected(); else AnimeJaNaiConf.SetVulkanSelected();
+                    linuxNotice = (rocmLib
+                        ? "Switched to the ROCm engine: this build ships it, not TensorRT "
+                        : "Switched to the Vulkan engine: this build ships it, not TensorRT ") +
+                                  "(TensorRT is the-database's separate NVIDIA build).";
+                }
+                else if (AnimeJaNaiConf is { RocmSelected: true } && !rocmLib && (vulkanLib || trtLib))
+                {
+                    if (vulkanLib) AnimeJaNaiConf.SetVulkanSelected(); else AnimeJaNaiConf.SetTensorRtSelected();
+                    linuxNotice = vulkanLib
+                        ? "Switched to Vulkan: this build ships the portable ncnn engine, not ROCm/MIGraphX."
+                        : "Switched to TensorRT: this build does not include the ROCm (AMD) engine.";
+                }
+                else if (AnimeJaNaiConf is { VulkanSelected: true } && !vulkanLib && (rocmLib || trtLib))
+                {
+                    if (rocmLib) AnimeJaNaiConf.SetRocmSelected(); else AnimeJaNaiConf.SetTensorRtSelected();
+                    linuxNotice = "Switched off Vulkan: the ncnn-Vulkan engine isn't in this build.";
+                }
+                BackendNotice = linuxNotice;
+                RifeMissing = !RifeOnDisk();
+                foreach (var slot in AnimeJaNaiConf?.UpscaleSlots ?? [])
+                {
+                    foreach (var chain in slot.Chains)
+                    {
+                        chain.RaisePropertyChanged(nameof(UpscaleChain.RifeToggleEnabled));
+                    }
+                }
+                return;
+            }
+
             bool trtInstalled = TrtOnDisk();
             bool? nvidia = ComponentManager.GpuNvidia;
             bool trtUsable = trtInstalled && nvidia != false;
@@ -132,6 +233,8 @@ namespace AnimeJaNaiConfEditor.ViewModels
         }
 
         public ComponentManagerViewModel ComponentManager { get; } = new();
+        // Linux-only readiness/setup tab (replaces the Windows updater-driven Components tab).
+        public LinuxSetupViewModel LinuxSetup { get; } = new();
 
         private int _selectedTabIndex;
         public int SelectedTabIndex
@@ -570,8 +673,15 @@ chain_2_rife=no";
 
         public AvaloniaList<string> GetAllModels()
         {
-            return new AvaloniaList<string>(Directory.GetFiles(OnnxPath).Where(filename => Path.GetExtension(filename).Equals(".onnx", StringComparison.CurrentCultureIgnoreCase))
+            // ONNX (TensorRT/DirectML) and ncnn .param (Vulkan) models live side by side and are
+            // referenced in the conf by their extensionless name, so a single deduped list of names
+            // covers every backend — and on Linux only .param/.bin exist.
+            return new AvaloniaList<string>(Directory.GetFiles(OnnxPath)
+                .Where(filename =>
+                    Path.GetExtension(filename).Equals(".onnx", StringComparison.CurrentCultureIgnoreCase) ||
+                    Path.GetExtension(filename).Equals(".param", StringComparison.CurrentCultureIgnoreCase))
                 .Select(filename => Path.GetFileNameWithoutExtension(filename))
+                .Distinct()
                 .Order().ToList());
         }
 
@@ -735,13 +845,22 @@ chain_2_rife=no";
 
             animeJaNaiConf.EnableLogging = ParseBool(parser.GetValue("global", "logging", "no"));
             animeJaNaiConf.BackendAutoFallback = ParseBool(parser.GetValue("global", "backend_auto_fallback", "no"));
-            if (Enum.TryParse(parser.GetValue("global", "backend", "TensorRT"), out Backend backend))
+            // When [global] backend is absent, Linux defaults to ROCm (MIGraphX, via aji_rocm,
+            // for AMD); Windows keeps its TensorRT default unchanged.
+            var defaultBackend = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "rocm" : "TensorRT";
+            if (Enum.TryParse(parser.GetValue("global", "backend", defaultBackend), ignoreCase: true, out Backend backend))
             {
                 switch (backend)
                 {
                     case Backend.DirectML:
                     case Backend.NCNN: // retired; the inference shim treats NCNN as DirectML
                         animeJaNaiConf.SetDirectMlSelected();
+                        break;
+                    case Backend.ROCm:
+                        animeJaNaiConf.SetRocmSelected();
+                        break;
+                    case Backend.Vulkan:
+                        animeJaNaiConf.SetVulkanSelected();
                         break;
                     case Backend.TensorRT:
                     default:
@@ -1176,6 +1295,14 @@ chain_2_rife=no";
         public async void LaunchBenchmark()
 #pragma warning restore CA1822 // Mark members as static
         {
+            // Linux has its own benchmark path, driven from the View so it can show
+            // progress and surface results in a dialog (see RunLinuxBenchmark*). It is
+            // never launched through here, so on non-Windows this stays a no-op.
+            if (!IsWindows)
+            {
+                return;
+            }
+
             await Task.Run(async () =>
             {
                 using var process = new Process();
@@ -1203,13 +1330,56 @@ chain_2_rife=no";
             });
         }
 
+        // ---- Linux / Vulkan playback benchmark ------------------------------------
+        // The Windows benchmark is a TensorRT-building PowerShell harness; the Vulkan
+        // backend has no engine-build step, so Linux runs the bundled mpv directly
+        // (LinuxBenchmark service). These helpers keep the View thin: it owns the
+        // progress dialog, the ViewModel owns the package paths and backend label.
+
+        // The package root (install root): mpv + portable_config + animejanai/ live
+        // here. RootDir already resolves both install layouts.
+        private static LinuxBenchmark.Paths LinuxBenchmarkPaths() =>
+            LinuxBenchmark.ResolvePaths(RootDir, DataDir);
+
+        // null = ready to run; otherwise a user-facing reason it cannot.
+        public string? LinuxBenchmarkPrerequisiteError() =>
+            LinuxBenchmark.CheckPrerequisites(LinuxBenchmarkPaths());
+
+        // The current backend label, used in the results banner / benchmark.txt.
+        // On Linux this is always ROCm, but read it from the conf so a future
+        // backend is reflected automatically.
+        public string LinuxBenchmarkBackendLabel =>
+            AnimeJaNaiConf?.SelectedBackend.ToString() ?? "ROCm";
+
+        public Task<System.Collections.Generic.List<LinuxBenchmark.Result>> RunLinuxBenchmarkAsync(
+            Action<string>? progress = null,
+            System.Threading.CancellationToken ct = default) =>
+            LinuxBenchmark.RunAsync(LinuxBenchmarkPaths(), LinuxBenchmarkBackendLabel, progress, ct);
+
 #pragma warning disable CA1822 // Mark members as static
         public async void OpenModelsDirectory()
 #pragma warning restore CA1822 // Mark members as static
         {
             await Task.Run(() =>
             {
-                Process.Start("explorer.exe", OnnxPath);
+                if (IsWindows)
+                {
+                    Process.Start("explorer.exe", OnnxPath);
+                }
+                else
+                {
+                    // xdg-open is the freedesktop default file-manager launcher on Linux;
+                    // macOS ships `open`. A missing launcher must not take the UI down.
+                    var launcher = OperatingSystem.IsMacOS() ? "open" : "xdg-open";
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(launcher, OnnxPath) { UseShellExecute = false });
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.WriteLine($"OpenModelsDirectory: {launcher} failed: {e.Message}");
+                    }
+                }
             });
         }
 
@@ -1307,6 +1477,8 @@ chain_2_rife=no";
                     x => x.EnableLogging,
                     x => x.TensorRtSelected,
                     x => x.DirectMlSelected,
+                    x => x.RocmSelected,
+                    x => x.VulkanSelected,
                     x => x.BackendAutoFallback,
                     x => x.TrtEngineSettings).Subscribe(x =>
                     {
@@ -1373,6 +1545,31 @@ chain_2_rife=no";
             set
             {
                 this.RaiseAndSetIfChanged(ref _directMlSelected, value);
+            }
+        }
+
+        // ROCm / aji_rocm (MIGraphX) backend — Linux/AMD.
+        private bool _rocmSelected = false;
+        [DataMember]
+        public bool RocmSelected
+        {
+            get => _rocmSelected;
+            set
+            {
+                this.RaiseAndSetIfChanged(ref _rocmSelected, value);
+            }
+        }
+
+        // ncnn-Vulkan (aji_vk) backend — the PORTABLE path (any Vulkan GPU on Linux, MoltenVK
+        // on macOS; no ROCm install required).
+        private bool _vulkanBackendSelected = false;
+        [DataMember]
+        public bool VulkanSelected
+        {
+            get => _vulkanBackendSelected;
+            set
+            {
+                this.RaiseAndSetIfChanged(ref _vulkanBackendSelected, value);
             }
         }
 
@@ -1556,12 +1753,32 @@ chain_2_rife=no";
         {
             TensorRtSelected = true;
             DirectMlSelected = false;
+            RocmSelected = false;
+            VulkanSelected = false;
         }
 
         public void SetDirectMlSelected()
         {
             DirectMlSelected = true;
             TensorRtSelected = false;
+            RocmSelected = false;
+            VulkanSelected = false;
+        }
+
+        public void SetRocmSelected()
+        {
+            RocmSelected = true;
+            TensorRtSelected = false;
+            DirectMlSelected = false;
+            VulkanSelected = false;
+        }
+
+        public void SetVulkanSelected()
+        {
+            VulkanSelected = true;
+            TensorRtSelected = false;
+            DirectMlSelected = false;
+            RocmSelected = false;
         }
 
         public void UserSelectTensorRt()
@@ -1574,6 +1791,18 @@ chain_2_rife=no";
         {
             BackendAutoFallback = false;
             SetDirectMlSelected();
+        }
+
+        public void UserSelectRocm()
+        {
+            BackendAutoFallback = false;
+            SetRocmSelected();
+        }
+
+        public void UserSelectVulkan()
+        {
+            BackendAutoFallback = false;
+            SetVulkanSelected();
         }
 
         private bool _backendAutoFallback;
@@ -1594,7 +1823,11 @@ chain_2_rife=no";
             set => this.RaiseAndSetIfChanged(ref _gpuSubtitles, value);
         }
 
-        public Backend SelectedBackend => DirectMlSelected ? Backend.DirectML : Backend.TensorRT;
+        public Backend SelectedBackend =>
+            VulkanSelected ? Backend.Vulkan :
+            RocmSelected ? Backend.ROCm :
+            DirectMlSelected ? Backend.DirectML :
+            Backend.TensorRT;
     }
 
     [DataContract]
@@ -1965,6 +2198,8 @@ chain_2_rife=no";
     {
         TensorRT,
         DirectML,
-        NCNN
+        NCNN,
+        ROCm,   // Linux/AMD: MIGraphX via aji_rocm.
+        Vulkan  // Linux/AMD: ncnn-Vulkan via aji_vk (portable; no ROCm install required).
     }
 }
