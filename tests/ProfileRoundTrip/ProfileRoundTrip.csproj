@@ -7,9 +7,13 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../AnimeJaNaiConfEditor/ViewModels/*.cs" Link="Production/%(Filename)%(Extension)" />
+    <!-- The view-models reference Services/ (Linux benchmark + benchmark-submission helpers). -->
+    <Compile Include="../../AnimeJaNaiConfEditor/Services/*.cs" Link="Production/Services/%(Filename)%(Extension)" />
     <PackageReference Include="Avalonia" Version="12.0.4" />
     <PackageReference Include="FluentAvaloniaUI" Version="3.0.0-preview4" />
     <PackageReference Include="ReactiveUI.Avalonia" Version="12.0.3" />
     <PackageReference Include="Salaros.ConfigParser" Version="0.3.8" />
+    <!-- WMI hardware info used by Services/BenchmarkSubmission.cs (Windows-only at runtime). -->
+    <PackageReference Include="System.Management" Version="10.0.0" />
   </ItemGroup>
 </Project>
