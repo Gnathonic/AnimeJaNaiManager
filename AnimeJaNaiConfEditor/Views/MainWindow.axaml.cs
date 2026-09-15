@@ -501,6 +501,27 @@ namespace AnimeJaNaiConfEditor.Views
             }
             panel.Children.Add(grid);
 
+            // The benchmark profiles are the built-in benchmark slots, which run the HD
+            // model at EVERY resolution so the numbers stay comparable across machines
+            // (benchmark.ps1 does the same on Windows). The shipping presets are
+            // resolution-conditional and fall to the SD model below 720p - and the SD
+            // model runs at full input resolution while the HD models pixel-unshuffle by
+            // 2 first, so per input pixel it costs ~2.5x HD Balanced / ~6.7x HD
+            // Performance. The sub-720p rows above therefore do NOT predict preset
+            // playback (measured on an M2 Pro: 640x480 reads 33/72 fps here, but preset
+            // playback of a 640x480 file runs the SD model at 15.8 fps and drops frames).
+            panel.Children.Add(new TextBlock
+            {
+                Margin = new Thickness(0, 12, 0, 0),
+                Opacity = .6,
+                FontSize = 11,
+                TextWrapping = TextWrapping.Wrap,
+                Text = "Note: these rows run the HD model at every resolution, so they stay " +
+                       "comparable across machines. The Quality/Balanced/Performance presets " +
+                       "switch to the SD model below 720p, which costs several times more per " +
+                       "input pixel - expect sub-720p preset playback to be slower than the rows above.",
+            });
+
             panel.Children.Add(new TextBlock
             {
                 Margin = new Thickness(0, 12, 0, 0),
