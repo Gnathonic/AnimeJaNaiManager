@@ -382,7 +382,7 @@ namespace AnimeJaNaiConfEditor.Views
                     MaxWidth = 460,
                     Text =
                         "This measures your real playback fps across several source resolutions " +
-                        "using the ROCm backend and your current profile.\n\n" +
+                        "using the backend selected in your conf (ROCm, Vulkan or TensorRT) and your current profile.\n\n" +
                         "It runs the bundled mpv offscreen (no windows open), generating short " +
                         "synthetic test clips with ffmpeg, so there is nothing to click. It " +
                         "usually takes about a minute.",

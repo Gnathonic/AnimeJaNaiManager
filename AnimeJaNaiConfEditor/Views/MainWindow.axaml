@@ -196,7 +196,7 @@
               Run Benchmarks
             </TextBlock>
           </StackPanel>
-          <TextBlock Width="280" TextWrapping="WrapWithOverflow" Margin="0,5,10,0" FontSize="10" Opacity=".5">Measure your real playback fps (the speed you will actually get) at several source resolutions on the ROCm backend. Runs the bundled mpv offscreen with no windows to click; usually takes about a minute.</TextBlock>
+          <TextBlock Width="280" TextWrapping="WrapWithOverflow" Margin="0,5,10,0" FontSize="10" Opacity=".5">Measure your real playback fps (the speed you will actually get) at several source resolutions on the backend selected in your conf. Runs the bundled mpv offscreen with no windows to click; usually takes about a minute.</TextBlock>
         </StackPanel>
       </Button>
       <Button HorizontalAlignment="Stretch" FontSize="13" Padding="10" Click="SubmitBenchmarkButtonClick" HorizontalContentAlignment="Left">
