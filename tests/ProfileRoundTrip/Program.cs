@@ -24,6 +24,31 @@ try
             throw new Exception($"Profile import lost RIFE ensemble={ensemble}");
         Console.WriteLine($"PASS ensemble={ensemble}");
     }
+
+    // Backend switching must persist the backend actually selected. The autosave watches
+    // the four Selected flags; each SetXxxSelected() sets the new flag before clearing the
+    // old ones, so an unwatched flag used to leave the conf at the PREVIOUS backend
+    // (switching Vulkan -> ROCm wrote backend=Vulkan).
+    string conf = Path.Combine(data, "animejanai.conf");
+    string BackendInConf() =>
+        File.ReadLines(conf).First(l => l.StartsWith("backend=", StringComparison.Ordinal))["backend=".Length..].Trim();
+    var expect = new (Action set, string name)[]
+    {
+        (vm.AnimeJaNaiConf.SetVulkanSelected, "Vulkan"),
+        (vm.AnimeJaNaiConf.SetRocmSelected, "ROCm"),
+        (vm.AnimeJaNaiConf.SetVulkanSelected, "Vulkan"),
+        (vm.AnimeJaNaiConf.SetTensorRtSelected, "TensorRT"),
+        (vm.AnimeJaNaiConf.SetRocmSelected, "ROCm"),
+        (vm.AnimeJaNaiConf.SetDirectMlSelected, "DirectML"),
+    };
+    foreach (var (set, name) in expect)
+    {
+        set();
+        string got = BackendInConf();
+        if (!string.Equals(got, name, StringComparison.OrdinalIgnoreCase))
+            throw new Exception($"FAIL backend switch: selected {name} but animejanai.conf says backend={got}");
+        Console.WriteLine($"PASS backend={name}");
+    }
     return 0;
 }
 catch (Exception ex)
