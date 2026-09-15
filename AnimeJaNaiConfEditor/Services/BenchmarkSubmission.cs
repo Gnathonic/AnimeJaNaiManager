@@ -137,6 +137,10 @@ namespace AnimeJaNaiConfEditor.Services
                 try { GatherFromWmi(); } catch { /* WMI unavailable: leave blank */ }
                 TryFillDxgiMemory();
             }
+            else if (OperatingSystem.IsMacOS())
+            {
+                try { GatherFromMac(); } catch { /* leave blank */ }
+            }
             else
             {
                 // Linux: gather from /proc, /sys, lspci and the ROCm install —
@@ -297,6 +301,24 @@ namespace AnimeJaNaiConfEditor.Services
         // leaves that field blank (same contract as the Windows path). The "driver"
         // field carries the AMD compute stack (ROCm + MIGraphX) — that is the driver
         // that actually governs inference performance on this backend.
+        // macOS: sysctl for CPU/RAM, system_profiler for the GPU, sw_vers for the OS.
+        // Apple silicon shares memory between CPU and GPU, so vram_mb is left blank.
+        void GatherFromMac()
+        {
+            static string Sysctl(string key) => LinuxSystemInfo.RunTool("sysctl", "-n " + key).Trim();
+            var cpu = Sysctl("machdep.cpu.brand_string");
+            if (cpu.Length > 0) Cpu = cpu;
+            if (int.TryParse(Sysctl("hw.physicalcpu"), out var cores)) CpuCores = cores;
+            if (int.TryParse(Sysctl("hw.ncpu"), out var threads)) CpuThreads = threads;
+            if (long.TryParse(Sysctl("hw.memsize"), out var bytes)) RamMb = bytes / 1048576;
+            var ver = LinuxSystemInfo.RunTool("sw_vers", "-productVersion").Trim();
+            if (ver.Length > 0) Os = "macOS " + ver;
+            var prof = LinuxSystemInfo.RunTool("system_profiler", "SPDisplaysDataType");
+            var m = Regex.Match(prof, @"Chipset Model:\s*(.+)");
+            if (m.Success) Gpu = m.Groups[1].Value.Trim();
+            Driver = "Metal via MoltenVK";
+        }
+
         void GatherFromLinux()
         {
             // GPU + the AMD compute driver stack ("ROCm X / MIGraphX Y") come from

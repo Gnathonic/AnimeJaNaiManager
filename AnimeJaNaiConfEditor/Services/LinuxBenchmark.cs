@@ -113,8 +113,8 @@ namespace AnimeJaNaiConfEditor.Services
         // Pre-flight check: report the first missing requirement, or null if good.
         public static string? CheckPrerequisites(Paths p)
         {
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return "The ROCm benchmark only runs on Linux.";
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                return "The offscreen benchmark runs on Linux and macOS only (Windows uses benchmark.ps1).";
             if (!File.Exists(p.Mpv))
                 return $"The bundled mpv was not found at {p.Mpv}.";
             if (!File.Exists(p.Conf))
@@ -416,8 +416,11 @@ namespace AnimeJaNaiConfEditor.Services
 
         private static string? FindFfmpeg()
         {
+            // GUI apps on macOS do not inherit the shell's PATH, so probe the Homebrew /
+            // MacPorts prefixes explicitly after PATH.
             var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
-            foreach (var dir in pathEnv.Split(Path.PathSeparator))
+            var dirs = pathEnv.Split(Path.PathSeparator).Concat(new[] { "/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin" });
+            foreach (var dir in dirs)
             {
                 if (string.IsNullOrWhiteSpace(dir)) continue;
                 var candidate = Path.Combine(dir, "ffmpeg");

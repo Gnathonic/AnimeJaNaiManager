@@ -67,10 +67,11 @@ namespace AnimeJaNaiConfEditor.ViewModels
             // AnimeJaNaiUpdater and resolves its platform's release assets itself.
             ComponentManager.Refreshed += RefreshComponentAwareness;
             _ = InitializeComponentManagerAsync();
-            if (!IsWindows)
+            if (IsLinux)
             {
                 // Linux additionally has the native readiness panel for the system
                 // pieces no pack can install (ROCm/MIGraphX, GPU driver state).
+                // macOS has no such pieces (Vulkan/MoltenVK ships in the package).
                 LinuxSetup.Refreshed += RefreshComponentAwareness;
                 LinuxSetup.Refresh();
             }
@@ -157,8 +158,10 @@ namespace AnimeJaNaiConfEditor.ViewModels
                 if (AnimeJaNaiConf is { TensorRtSelected: true } && !trtLib && (rocmLib || vulkanLib))
                 {
                     if (rocmLib) AnimeJaNaiConf.SetRocmSelected(); else AnimeJaNaiConf.SetVulkanSelected();
-                    linuxNotice = "Switched to the AMD engine: this build ships it, not TensorRT " +
-                                  "(TensorRT is the-database's separate NVIDIA/Linux build).";
+                    linuxNotice = (rocmLib
+                        ? "Switched to the ROCm engine: this build ships it, not TensorRT "
+                        : "Switched to the Vulkan engine: this build ships it, not TensorRT ") +
+                                  "(TensorRT is the-database's separate NVIDIA build).";
                 }
                 else if (AnimeJaNaiConf is { RocmSelected: true } && !rocmLib && (vulkanLib || trtLib))
                 {
@@ -1365,8 +1368,17 @@ chain_2_rife=no";
                 }
                 else
                 {
-                    // xdg-open is the freedesktop default file-manager launcher on Linux.
-                    Process.Start(new ProcessStartInfo("xdg-open", OnnxPath) { UseShellExecute = false });
+                    // xdg-open is the freedesktop default file-manager launcher on Linux;
+                    // macOS ships `open`. A missing launcher must not take the UI down.
+                    var launcher = OperatingSystem.IsMacOS() ? "open" : "xdg-open";
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(launcher, OnnxPath) { UseShellExecute = false });
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.WriteLine($"OpenModelsDirectory: {launcher} failed: {e.Message}");
+                    }
                 }
             });
         }
@@ -1466,6 +1478,7 @@ chain_2_rife=no";
                     x => x.TensorRtSelected,
                     x => x.DirectMlSelected,
                     x => x.RocmSelected,
+                    x => x.VulkanSelected,
                     x => x.BackendAutoFallback,
                     x => x.TrtEngineSettings).Subscribe(x =>
                     {
@@ -1535,21 +1548,20 @@ chain_2_rife=no";
             }
         }
 
-        // Vulkan / aji_vk (ncnn) backend — the cross-platform path used on Linux/AMD.
-        private bool _vulkanSelected = false;
+        // ROCm / aji_rocm (MIGraphX) backend — Linux/AMD.
+        private bool _rocmSelected = false;
         [DataMember]
         public bool RocmSelected
         {
-            get => _vulkanSelected;
+            get => _rocmSelected;
             set
             {
-                this.RaiseAndSetIfChanged(ref _vulkanSelected, value);
+                this.RaiseAndSetIfChanged(ref _rocmSelected, value);
             }
         }
 
-        // ncnn-Vulkan (aji_vk) backend — the PORTABLE Linux/AMD path (no ROCm install
-        // required). Distinct from RocmSelected above (whose backing field is, confusingly,
-        // named _vulkanSelected but is the ROCm/MIGraphX selection).
+        // ncnn-Vulkan (aji_vk) backend — the PORTABLE path (any Vulkan GPU on Linux, MoltenVK
+        // on macOS; no ROCm install required).
         private bool _vulkanBackendSelected = false;
         [DataMember]
         public bool VulkanSelected

@@ -785,7 +785,7 @@
     </ScrollViewer>
   </TabItem>
 
-  <TabItem Header="System Setup" IsVisible="{x:Static vm:MainWindowViewModel.IsNotWindows}">
+  <TabItem Header="System Setup" IsVisible="{x:Static vm:MainWindowViewModel.IsLinux}">
     <ScrollViewer HorizontalScrollBarVisibility="Disabled">
       <StackPanel Margin="24" Spacing="14" MaxWidth="820" HorizontalAlignment="Left" DataContext="{Binding LinuxSetup}">
 
